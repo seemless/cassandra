@@ -124,7 +124,8 @@ async def get_documents():
     try:
         query = """
         SELECT doc_identifier, name, version, website 
-        FROM documents 
+        FROM documents
+        WHERE type != 'mapping_document'
         ORDER BY name
         """
         results = conn.execute(query).fetchall()
@@ -200,14 +201,15 @@ async def create_provenance_document(doc_info: ProvenanceDocumentCreate):
         
         # Insert new provenance document
         insert_query = """
-        INSERT INTO documents (doc_identifier, name, version, website)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO documents (doc_identifier, name, version, website, type)
+        VALUES (?, ?, ?, ?, ?)
         """
         conn.execute(insert_query, (
             prov_doc_identifier,
             prov_doc_name,
             "1.0",
-            prov_doc_website
+            prov_doc_website,
+            'mapping_document'
         ))
         conn.commit()
         

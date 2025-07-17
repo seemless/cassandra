@@ -123,12 +123,14 @@ class DocumentMapper {
 
         // Add document options
         this.documents.forEach(doc => {
+
             const option = document.createElement('option');
             option.value = doc.doc_identifier;
             option.textContent = `${doc.name} (${doc.version})`;
-            
+
             targetSelect.appendChild(option.cloneNode(true));
             sourceSelect.appendChild(option.cloneNode(true));
+
         });
     }
 
