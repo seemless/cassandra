@@ -53,6 +53,53 @@ def process_excel_file(file_path: str) -> List[Dict[str, Any]]:
     return all_rows
 
 
+def process_new_excel_files(file_path: str) -> List[Dict[str, Any]]:
+    """
+    Process Excel files with single-sheet format (CSF v1.1 and CSF v2.0).
+    
+    These files have a different structure than the SP 800-53 format:
+    - Single "Relationships" sheet instead of multiple sheets
+    - Missing "Security Control Baseline" column
+    - Same core relationship columns
+    
+    Args:
+        file_path: Path to the Excel file
+        
+    Returns:
+        List of dictionaries representing all rows from the single sheet
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Excel file not found: {file_path}")
+    
+    # Read the Excel file
+    xl = pd.ExcelFile(file_path)
+    
+    print(f"Processing Excel file: {file_path}")
+    print(f"Found {len(xl.sheet_names)} sheet(s): {xl.sheet_names}")
+    
+    # For new format files, there should be only one sheet
+    if len(xl.sheet_names) != 1:
+        raise ValueError(f"Expected single sheet for new format, found {len(xl.sheet_names)} sheets")
+    
+    sheet_name = xl.sheet_names[0]
+    print(f"\nProcessing sheet: {sheet_name}")
+    
+    # Read the sheet
+    df = pd.read_excel(xl, sheet_name=sheet_name)
+    
+    # Clean column names (remove newlines and extra spaces)
+    df.columns = [col.replace('\n', ' ').strip() for col in df.columns]
+    
+    # Convert DataFrame to list of dictionaries
+    # fillna('') replaces NaN values with empty strings
+    sheet_data = df.fillna('').to_dict('records')
+    
+    print(f"  - Processed {len(sheet_data)} rows")
+    print(f"Total rows: {len(sheet_data)}")
+    
+    return sheet_data
+
+
 def map_dictionaries(data: List[Dict[str, Any]], mapping: Dict[str, str]) -> List[Dict[str, Any]]:
     """
     Transform a list of dictionaries by mapping keys according to the provided mapping.
@@ -94,6 +141,63 @@ def map_dictionaries(data: List[Dict[str, Any]], mapping: Dict[str, str]) -> Lis
     return mapped_data
 
 
+def detect_excel_file_type(file_path: str) -> str:
+    """
+    Detect the Excel file type based on its structure.
+    
+    Args:
+        file_path: Path to the Excel file
+        
+    Returns:
+        String indicating file type: "sp800-53" or "csf"
+        
+    Raises:
+        ValueError: If file type cannot be determined
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Excel file not found: {file_path}")
+    
+    try:
+        xl = pd.ExcelFile(file_path)
+        
+        # Check number of sheets first
+        num_sheets = len(xl.sheet_names)
+        
+        # Read first sheet to check columns
+        first_sheet = xl.sheet_names[0]
+        df = pd.read_excel(xl, sheet_name=first_sheet, nrows=0)  # Just read headers
+        
+        # Clean column names for comparison
+        columns = [col.replace('\n', ' ').strip() for col in df.columns]
+        
+        # SP 800-53 format characteristics:
+        # - Multiple sheets (typically 20)
+        # - Has "Security Control Baseline" column
+        if num_sheets > 1 and "Security Control Baseline" in columns:
+            return "sp800-53"
+        
+        # CSF format characteristics:
+        # - Single sheet (typically named "Relationships")
+        # - No "Security Control Baseline" column
+        # - Has the core relationship columns
+        elif num_sheets == 1 and "Security Control Baseline" not in columns:
+            # Verify it has the expected CSF columns
+            expected_columns = [
+                "Focal Document Element",
+                "Focal Document Element Description",
+                "Reference Document Element"
+            ]
+            if all(col in columns for col in expected_columns):
+                return "csf"
+        
+        # If we can't determine the type, raise an error
+        raise ValueError(f"Cannot determine file type for {file_path}. "
+                        f"Sheets: {num_sheets}, Columns: {columns}")
+        
+    except Exception as e:
+        raise ValueError(f"Error detecting file type for {file_path}: {str(e)}")
+
+
 def main():
     """Main function to process Excel files in the data directory."""
     data_dir = "data"
@@ -117,11 +221,35 @@ def main():
         print(f"{'='*60}")
         
         try:
-            # Process the Excel file
-            data = process_excel_file(file_path)
+            # Detect file type and process accordingly
+            file_type = detect_excel_file_type(file_path)
+            print(f"Detected file type: {file_type}")
             
-            # Example: Print summary and sample rows
+            if file_type == "sp800-53":
+                data = process_excel_file(file_path)
+                
+                # Example mapping for SP 800-53 files (includes Security Control Baseline)
+                elements_mapping = {
+                    "element_identifier": "Focal Document Element",
+                    "text": "Focal Document Element Description",
+                    "element_type": "Security Control Baseline"
+                }
+                
+            elif file_type == "csf":
+                data = process_new_excel_files(file_path)
+                
+                # Example mapping for CSF files (no Security Control Baseline)
+                elements_mapping = {
+                    "element_identifier": "Focal Document Element",
+                    "text": "Focal Document Element Description"
+                }
+            
+            else:
+                raise ValueError(f"Unsupported file type: {file_type}")
+            
+            # Display summary
             print(f"\nSummary for {excel_file}:")
+            print(f"  File type: {file_type}")
             print(f"  Total rows: {len(data)}")
             if data:
                 print(f"  Columns: {list(data[0].keys())}")
@@ -130,20 +258,12 @@ def main():
                     print(f"    {key}: {str(value)[:100]}{'...' if len(str(value)) > 100 else ''}")
             
             # Example: Map dictionaries to database schema
-            # Mapping for elements table columns
-            elements_mapping = {
-                "element_identifier": "Focal Document Element",
-                "text": "Focal Document Element Description",
-                "element_type": "Security Control Baseline"
-            }
-            
             mapped_data = map_dictionaries(data, elements_mapping)
             
             print(f"\nMapping example - first 3 mapped rows:")
             for row in mapped_data[:3]:
-                print(f"  element_identifier: {row['element_identifier']}")
-                print(f"  text: {row['text'][:50]}{'...' if len(row['text']) > 50 else ''}")
-                print(f"  element_type: {row['element_type']}")
+                for key, value in row.items():
+                    print(f"  {key}: {str(value)[:50]}{'...' if len(str(value)) > 50 else ''}")
                 print("  ---")
             
         except Exception as e:
