@@ -28,6 +28,7 @@ class ProvenanceDocumentCreate(BaseModel):
     target_doc_identifier: str
     source_doc_identifier: str
 
+
 # Load CPRT schema for validation
 schema_path = Path("static/cprt_schema.json")
 with open(schema_path, 'r') as f:
@@ -151,9 +152,9 @@ async def get_document_elements(
         params = [doc_identifier]
         
         if search:
-            base_query += " AND (e.title LIKE ? OR e.text LIKE ?)"
+            base_query += " AND (e.element_identifier LIKE ? OR e.title LIKE ? OR e.text LIKE ?)"
             search_term = f"%{search}%"
-            params.extend([search_term, search_term])
+            params.extend([search_term, search_term, search_term])
             
         base_query += " ORDER BY e.element_identifier"
         
@@ -312,16 +313,18 @@ async def export_relationships(
     from fastapi.responses import StreamingResponse
     conn = get_db_connection()
     try:
-        base_query = """
+        # Base relationships query to get all relationship data
+        relationships_query = """
         SELECT 
-            se.element_identifier as source_element,
-            sd.doc_identifier as source_document,
-            se.title as source_title,
-            de.element_identifier as dest_element,
-            dd.doc_identifier as dest_document,
-            de.title as dest_title,
-            rt.relationship_identifier as relationship_type,
-            pd.doc_identifier as provenance_document
+            se.element_identifier as source_element_identifier,
+            sd.doc_identifier as source_doc_identifier,
+            de.element_identifier as dest_element_identifier,
+            dd.doc_identifier as dest_doc_identifier,
+            pd.doc_identifier as provenance_doc_identifier,
+            rt.relationship_identifier as relationship_identifier,
+            r.comment,
+            se.element_id as source_element_id,
+            de.element_id as dest_element_id
         FROM relationships r
         JOIN elements se ON r.source_id = se.element_id
         JOIN documents sd ON se.document_id = sd.document_id
@@ -338,33 +341,96 @@ async def export_relationships(
             prov_doc_list = [doc.strip() for doc in provenance_docs.split(',') if doc.strip()]
             if prov_doc_list:
                 placeholders = ','.join(['?' for _ in prov_doc_list])
-                base_query += f" WHERE pd.doc_identifier IN ({placeholders})"
+                relationships_query += f" WHERE pd.doc_identifier IN ({placeholders})"
                 params.extend(prov_doc_list)
         
-        base_query += " ORDER BY sd.doc_identifier, se.element_identifier"
+        relationships_query += " ORDER BY sd.doc_identifier, se.element_identifier"
         
-        results = conn.execute(base_query, params).fetchall()
-        df = pd.DataFrame([dict(row) for row in results])
+        relationships_results = conn.execute(relationships_query, params).fetchall()
+        relationships_df = pd.DataFrame([dict(row) for row in relationships_results])
         
-        if df.empty:
+        if relationships_df.empty:
             raise HTTPException(status_code=404, detail="No relationships found")
+        
+        # Identify the two mapped documents (source and destination documents)
+        unique_source_docs = set(relationships_df['source_doc_identifier'].unique())
+        unique_dest_docs = set(relationships_df['dest_doc_identifier'].unique())
+        mapped_documents = list(unique_source_docs.union(unique_dest_docs))
+        
+        # Get documents data for the two mapped documents
+        if mapped_documents:
+            doc_placeholders = ','.join(['?' for _ in mapped_documents])
+            documents_query = f"""
+            SELECT doc_identifier, name, version, website, type
+            FROM documents 
+            WHERE doc_identifier IN ({doc_placeholders})
+            ORDER BY doc_identifier
+            """
+            documents_results = conn.execute(documents_query, mapped_documents).fetchall()
+            documents_df = pd.DataFrame([dict(row) for row in documents_results])
+        else:
+            documents_df = pd.DataFrame()
+        
+        # Get elements that are referenced in relationships
+        referenced_element_ids = list(set(relationships_df['source_element_id'].tolist() + relationships_df['dest_element_id'].tolist()))
+        
+        if referenced_element_ids:
+            element_placeholders = ','.join(['?' for _ in referenced_element_ids])
+            elements_query = f"""
+            SELECT 
+                d.doc_identifier,
+                e.element_type,
+                e.element_identifier,
+                e.title,
+                e.text
+            FROM elements e
+            JOIN documents d ON e.document_id = d.document_id
+            WHERE e.element_id IN ({element_placeholders})
+            ORDER BY d.doc_identifier, e.element_identifier
+            """
+            elements_results = conn.execute(elements_query, referenced_element_ids).fetchall()
+            elements_df = pd.DataFrame([dict(row) for row in elements_results])
+        else:
+            elements_df = pd.DataFrame()
+        
+        # Get relationship types used in the export
+        unique_relationship_types = relationships_df['relationship_identifier'].unique()
+        if len(unique_relationship_types) > 0:
+            rel_type_placeholders = ','.join(['?' for _ in unique_relationship_types])
+            rel_types_query = f"""
+            SELECT relationship_identifier, description
+            FROM relationship_types
+            WHERE relationship_identifier IN ({rel_type_placeholders})
+            ORDER BY relationship_identifier
+            """
+            rel_types_results = conn.execute(rel_types_query, list(unique_relationship_types)).fetchall()
+            relationship_types_df = pd.DataFrame([dict(row) for row in rel_types_results])
+        else:
+            relationship_types_df = pd.DataFrame()
+        
+        # Clean up relationships dataframe to remove internal IDs
+        relationships_export_df = relationships_df.drop(columns=['source_element_id', 'dest_element_id'])
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         if format == "excel":
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df.to_excel(writer, sheet_name='Relationships', index=False)
+                # Write all 4 tabs
+                documents_df.to_excel(writer, sheet_name='documents', index=False)
+                elements_df.to_excel(writer, sheet_name='elements', index=False)
+                relationships_export_df.to_excel(writer, sheet_name='relationships', index=False)
+                relationship_types_df.to_excel(writer, sheet_name='relationship_types', index=False)
             output.seek(0)
             
             return StreamingResponse(
                 io.BytesIO(output.getvalue()),
                 media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                headers={"Content-Disposition": f"attachment; filename=relationships_{timestamp}.xlsx"}
+                headers={"Content-Disposition": f"attachment; filename=relationships_cprt_{timestamp}.xlsx"}
             )
-        else:  # CSV
+        else:  # CSV - export relationships only for backward compatibility
             output = io.StringIO()
-            df.to_csv(output, index=False)
+            relationships_export_df.to_csv(output, index=False)
             
             return StreamingResponse(
                 io.StringIO(output.getvalue()),

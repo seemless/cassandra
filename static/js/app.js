@@ -176,19 +176,44 @@ class DocumentMapper {
     displaySourceElements(elements) {
         const container = document.getElementById('sourceElements');
         
+        // Force clear any existing content and event listeners
+        container.innerHTML = '';
+        
         if (elements.length === 0) {
             container.innerHTML = '<p class="text-muted">No elements found</p>';
             return;
         }
 
-        container.innerHTML = elements.map(element => `
-            <div class="source-element" draggable="true" data-element='${JSON.stringify(element)}'>
-                <div class="element-type">${element.element_type}</div>
-                <div class="element-id">${element.element_identifier}</div>
-                <div class="element-title">${element.title}</div>
-                <div class="element-text">${element.text}</div>
-            </div>
-        `).join('');
+        container.innerHTML = elements.map((element, index) => {
+            // Ensure element data is properly structured and encode safely
+            const safeElement = {
+                element_identifier: element.element_identifier || '',
+                element_type: element.element_type || '',
+                title: element.title || '',
+                text: element.text || ''
+            };
+            
+            // Use Base64 encoding to avoid HTML attribute parsing issues with special characters
+            let elementDataAttr = '';
+            try {
+                const jsonString = JSON.stringify(safeElement);
+                // Use Base64 encoding to completely avoid HTML entity issues
+                elementDataAttr = btoa(jsonString);
+                console.log(`Encoded element ${safeElement.element_identifier}: ${elementDataAttr.length} chars (Base64)`);
+            } catch (error) {
+                console.error('Error encoding element data:', error, element);
+                elementDataAttr = btoa('{}'); // Empty object as fallback
+            }
+            
+            return `
+                <div class="source-element" draggable="true" data-element-b64="${elementDataAttr}" data-index="${index}">
+                    <div class="element-type">${safeElement.element_type}</div>
+                    <div class="element-id">${safeElement.element_identifier}</div>
+                    <div class="element-title">${safeElement.title}</div>
+                    <div class="element-text">${safeElement.text}</div>
+                </div>
+            `;
+        }).join('');
 
         // Re-attach drag event listeners
         this.attachDragListeners();
@@ -323,6 +348,15 @@ class DocumentMapper {
     }
 
     async loadAndDisplaySourceElements(docIdentifier) {
+        // Clear any existing elements first to avoid old cached DOM
+        const container = document.getElementById('sourceElements');
+        container.innerHTML = '<p class="text-muted">Loading elements...</p>';
+        
+        // Force remove any old event listeners by completely clearing the container
+        const newContainer = container.cloneNode(false);
+        container.parentNode.replaceChild(newContainer, container);
+        newContainer.innerHTML = '<p class="text-muted">Loading elements...</p>';
+        
         this.sourceElements = await this.loadDocumentElements(docIdentifier);
         this.displaySourceElements(this.sourceElements);
         document.getElementById('searchInput').value = '';
@@ -357,12 +391,77 @@ class DocumentMapper {
             mappingArea.classList.remove('drag-over');
             
             const elementData = e.dataTransfer.getData('text/plain');
-            if (elementData) {
+            console.log('Drop event triggered, data received:', elementData);
+            
+            if (!elementData) {
+                console.warn('No element data received in drop event');
+                this.showToast('Warning', 'No element data found. Please try dragging the element again.', 'warning');
+                return;
+            }
+            
+            try {
+                console.log('Raw drop data received:', elementData);
+                console.log('Drop data length:', elementData.length);
+                console.log('Drop data preview:', elementData.substring(0, 100) + '...');
+                
+                // Check if this looks like problematic data around position 254
+                if (elementData.length > 254) {
+                    console.log('Character at position 254:', JSON.stringify(elementData[254]));
+                    console.log('Context around position 254:', JSON.stringify(elementData.substring(245, 265)));
+                }
+                
+                let element = null;
+                
+                // Try to detect if this is corrupted HTML entity data and fix it
+                if (elementData.includes('&#39;') || elementData.includes('&quot;')) {
+                    console.log('⚠️ Detected old HTML entity encoded data in drop - attempting to clean');
+                    try {
+                        // This might be old corrupted data, try to clean it
+                        const cleanedData = elementData.replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+                        element = JSON.parse(cleanedData);
+                        console.log('✅ Successfully parsed cleaned HTML entity data:', element.element_identifier);
+                    } catch (cleanError) {
+                        console.error('❌ Failed to clean HTML entity data:', cleanError);
+                        throw cleanError;
+                    }
+                } else {
+                    // Normal JSON parsing
+                    element = JSON.parse(elementData);
+                    console.log('✅ Parsed element data successfully:', element.element_identifier);
+                }
+                
+                // Validate element structure
+                if (!element || typeof element !== 'object') {
+                    throw new Error('Element data is not a valid object');
+                }
+                
+                if (!element.element_identifier) {
+                    throw new Error('Element is missing required identifier');
+                }
+                
+                // Ensure all required properties exist with fallbacks
+                const validElement = {
+                    element_identifier: element.element_identifier,
+                    element_type: element.element_type || 'unknown',
+                    title: element.title || 'N/A',
+                    text: element.text || ''
+                };
+                
+                console.log('Adding validated element to mapping:', validElement);
+                this.addMappedElement(validElement);
+                
+            } catch (error) {
+                console.error('Error processing dropped element:', error);
+                this.showToast('Error', `Failed to add element: ${error.message}`, 'error');
+                
+                // Try to extract element identifier from the raw data for debugging
                 try {
-                    const element = JSON.parse(elementData);
-                    this.addMappedElement(element);
-                } catch (error) {
-                    console.error('Error parsing dropped element:', error);
+                    const debugMatch = elementData.match(/"element_identifier":"([^"]+)"/);
+                    if (debugMatch) {
+                        console.log('Debug: Found element_identifier in raw data:', debugMatch[1]);
+                    }
+                } catch (debugError) {
+                    console.log('Debug: Could not extract identifier from raw data');
                 }
             }
         });
@@ -371,14 +470,73 @@ class DocumentMapper {
     attachDragListeners() {
         const sourceElements = document.querySelectorAll('.source-element');
         
-        sourceElements.forEach(element => {
+        sourceElements.forEach((element, index) => {
             element.addEventListener('dragstart', (e) => {
-                e.dataTransfer.setData('text/plain', element.dataset.element);
-                element.classList.add('dragging');
+                try {
+                    // Get element data using multiple methods with improved fallbacks
+                    let elementData = null;
+                    
+                    // Method 1: Try Base64 encoded data first (most reliable)
+                    if (element.dataset.elementB64) {
+                        try {
+                            console.log('Attempting Base64 decoding for element...');
+                            const base64Data = element.dataset.elementB64;
+                            console.log(`Base64 data length: ${base64Data.length} chars`);
+                            
+                            const decodedData = atob(base64Data);
+                            console.log(`Decoded JSON length: ${decodedData.length} chars`);
+                            console.log(`Decoded JSON preview: ${decodedData.substring(0, 100)}...`);
+                            
+                            elementData = JSON.parse(decodedData);
+                            console.log('✅ Base64 decoding successful:', elementData.element_identifier);
+                        } catch (parseError) {
+                            console.error('❌ Base64 parsing failed:', parseError);
+                            console.error('Base64 data:', element.dataset.elementB64);
+                        }
+                    } else {
+                        console.warn('⚠️ No data-element-b64 attribute found on element');
+                    }
+                    
+                    // Method 2: Skip old HTML entity method - it's prone to parsing errors with special characters
+                    // The HTML entity decoding can fail with apostrophes and other special characters
+                    
+                    // Method 3: Fallback to sourceElements array
+                    if (!elementData && element.dataset.index !== undefined) {
+                        try {
+                            const elementIndex = parseInt(element.dataset.index);
+                            if (this.sourceElements && this.sourceElements[elementIndex]) {
+                                elementData = this.sourceElements[elementIndex];
+                                console.log('✓ Using fallback element data from sourceElements array:', elementData.element_identifier);
+                            }
+                        } catch (indexError) {
+                            console.warn('Failed to use sourceElements fallback:', indexError);
+                        }
+                    }
+                    
+                    // Final validation
+                    if (!elementData || !elementData.element_identifier) {
+                        console.error('No valid element data available for drag operation');
+                        e.preventDefault();
+                        return false;
+                    }
+                    
+                    // Set drag data
+                    e.dataTransfer.setData('text/plain', JSON.stringify(elementData));
+                    e.dataTransfer.effectAllowed = 'copy';
+                    element.classList.add('dragging');
+                    
+                    console.log('✅ Drag started successfully for element:', elementData.element_identifier);
+                    
+                } catch (error) {
+                    console.error('❌ Error in dragstart handler:', error);
+                    e.preventDefault();
+                    return false;
+                }
             });
 
             element.addEventListener('dragend', (e) => {
                 element.classList.remove('dragging');
+                console.log('Drag ended');
             });
         });
     }
